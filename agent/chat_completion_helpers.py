@@ -1939,6 +1939,133 @@ def _candidate_pool_exhausted(agent, fb_provider: str, fb_model: str) -> bool:
     return until is None or until - time.time() > 600
 
 
+def _fallback_candidate_credential(fb: dict, fb_provider: str) -> str:
+    """The credential the RUNTIME would use for this candidate, best effort.
+
+    The window has to be resolved with the candidate's own credential: the same model slug
+    can carry a different limit per provider (copilot's ``gpt-4.1`` is 128,000, not the
+    1,047,576 the generic table reports), and a candidate resolved without its key falls
+    back to the generic number — which would make a too-small candidate look big enough.
+    """
+    try:
+        from hermes_cli.fallback_config import resolve_entry_api_key
+        key = str(resolve_entry_api_key(fb) or "").strip()
+        if key:
+            return key
+    except Exception:
+        pass
+    # Provider-owned credential seam: a provider profile can hold the secret itself.
+    try:
+        from providers import get_provider_profile
+        profile = get_provider_profile(fb_provider) if fb_provider else None
+        resolver = getattr(profile, "resolve_api_key_secret", None) if profile is not None else None
+        if callable(resolver):
+            secret = resolver()
+            if secret:
+                return str(secret[0] or "").strip()
+    except Exception:
+        pass
+    # A provider whose credential is ambient (Copilot: env vars, then the gh CLI) and whose
+    # live catalog is the authoritative limit. Providers that ship as a plugin resolve their
+    # own credential inside their profile, so this is a fallback for the in-tree case only.
+    if fb_provider in {"copilot", "copilot-acp", "github-copilot"}:
+        try:
+            from hermes_cli.copilot_auth import resolve_copilot_token
+            return str((resolve_copilot_token() or ("", ""))[0] or "").strip()
+        except Exception:
+            return ""
+    return ""
+
+
+def _fallback_candidate_window(fb: dict, fb_provider: str, fb_model: str) -> int:
+    """The context window the RUNTIME would use for this candidate, or 0 when unknown.
+
+    An unknown window is reported as 0 so the caller treats it as "no evidence" rather
+    than "fits": the provider's live catalog is consulted when it is reachable, and a
+    miss there means the limit could not be established.
+    """
+    if fb.get("context_length"):
+        try:
+            return int(fb["context_length"])
+        except (TypeError, ValueError):
+            return 0
+    api_key = _fallback_candidate_credential(fb, fb_provider)
+    # Provider-owned live catalog: the provider enforces its own limit, and it knows
+    # best which of its credentials applies.
+    try:
+        from providers import get_provider_profile
+        profile = get_provider_profile(fb_provider) if fb_provider else None
+        live = getattr(profile, "live_context_length", None) if profile is not None else None
+        if callable(live):
+            ctx = live(fb_model, api_key=api_key, base_url=str(fb.get("base_url") or ""))
+            if ctx:
+                return int(ctx)
+    except Exception:
+        pass
+    try:
+        from agent.model_metadata import get_model_context_length
+        return int(get_model_context_length(
+            fb_model,
+            base_url=str(fb.get("base_url") or ""),
+            api_key=api_key,
+            provider=fb_provider,
+        ) or 0)
+    except Exception:
+        return 0
+
+
+def _fallback_window_cannot_hold_session(agent, fb: dict, fb_provider: str, fb_model: str) -> bool:
+    """True when the candidate's context window is smaller than the request this session must send.
+
+    A fallback whose window cannot hold the request is a guaranteed dead end: the provider
+    rejects the prompt with ``model_max_prompt_tokens_exceeded`` before any answer, and the
+    session is then reported as "cannot compress further" even though the PRIMARY model had
+    a window large enough for it (#113737). The floor that matters is the size of the request
+    as it goes on the wire — system prompt + tool schemas + the message bodies — not the
+    compressible message text alone, because the parts a plugin engine cannot rewrite
+    (assistant ``tool_calls`` arguments, tool results) stay put however hard it tries.
+
+    Only a candidate whose window is KNOWN and clearly too small is skipped. An unknown
+    window (no catalog, no probe) is not evidence, so the candidate stays eligible.
+    """
+    fb_window = _fallback_candidate_window(fb, fb_provider, fb_model)
+    if fb_window <= 0:
+        return False
+
+    floor = _session_request_floor_tokens(agent)
+    if floor <= 0:
+        return False
+    if floor <= fb_window:
+        return False
+    logger.warning(
+        "Fallback skip: %s/%s window (%s tokens) is smaller than this session's request (%s tokens); "
+        "switching to it would fail with model_max_prompt_tokens_exceeded",
+        fb_provider, fb_model, f"{fb_window:,}", f"{floor:,}",
+    )
+    return True
+
+
+def _session_request_floor_tokens(agent) -> int:
+    """The size of the last request this session actually put on the wire.
+
+    The compressor records the provider's own ``prompt_tokens`` for the last response
+    (``last_real_prompt_tokens`` on the built-in compressor, ``last_prompt_tokens`` on a
+    plugin engine), which is the request AS SENT — system prompt + tool schemas +
+    message bodies. That is the honest floor for a session that has already overflowed:
+    compression can shrink the message text, but not the tool schemas and not the
+    assistant tool-call arguments, so the wire size is what the next model must fit.
+
+    Returns 0 when nothing was measured yet: an unmeasured floor is not evidence, and
+    the caller then leaves the fallback candidate eligible.
+    """
+    compressor = getattr(agent, "context_compressor", None)
+    for attr in ("last_real_prompt_tokens", "last_prompt_tokens"):
+        value = int(getattr(compressor, attr, 0) or 0)
+        if value > 0:
+            return value
+    return 0
+
+
 def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider: str, fb_model: str, unavailable: set) -> bool:
     """True when the entry is already unavailable, malformed, locally unusable, or resolves
     to the backend that just failed (falling back to it would loop the failure)."""
@@ -1946,6 +2073,8 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
         logger.debug("Fallback skip: %s previously marked unavailable", fb_key)
         return True
     if not fb_provider or not fb_model:
+        return True
+    if _fallback_window_cannot_hold_session(agent, fb, fb_provider, fb_model):
         return True
     from agent.fallback_cooldown import _is_entitlement_rejected
     if _is_entitlement_rejected(agent, fb_provider, fb_model):
