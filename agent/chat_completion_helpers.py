@@ -1402,11 +1402,11 @@ def _build_bedrock_kwargs(agent, api_messages, tools_for_api, reasoning_config):
 def _build_codex_kwargs(agent, api_messages, tools_for_api, reasoning_config, request_overrides, cache_scope_id):
     from agent.codex_responses_adapter import classify_responses_route
     from agent.native_compaction import native_compaction_context_management
-    is_codex_backend, is_xai_responses, endpoint = classify_responses_route(agent)
+    is_codex_backend, is_xai_responses, is_github_responses = classify_responses_route(agent)
     # Native server-side compaction (gpt-5.6 on direct OpenAI / ChatGPT Codex routes
     # only) — None on every other route/model, leaving the request unchanged.
     context_management = native_compaction_context_management(agent, is_codex_backend=is_codex_backend,
-        is_xai_responses=is_xai_responses, endpoint=endpoint)
+        is_xai_responses=is_xai_responses, is_github_responses=is_github_responses)
     # xAI's /responses endpoint 400s on ``pattern``/``format`` schema keywords and on
     # ``enum`` values containing ``/`` — strip them (#27197). Deep-copy first: the
     # sanitizers mutate in place and tools_for_api aliases agent.tools (#27907).
@@ -1426,9 +1426,9 @@ def _build_codex_kwargs(agent, api_messages, tools_for_api, reasoning_config, re
         cache_scope_id=cache_scope_id, base_url=agent.base_url,
         max_tokens=ephemeral_out if ephemeral_out is not None else agent.max_tokens,
         timeout=agent._resolved_api_call_timeout(), request_overrides=request_overrides,
-        provider=getattr(agent, "provider", None),
+        provider=getattr(agent, "provider", None), is_github_responses=is_github_responses,
         is_codex_backend=is_codex_backend, is_xai_responses=is_xai_responses,
-        profile_reasoning=agent._endpoint_reasoning_payload() if endpoint.profile_reasoning else None,
+        github_reasoning_extra=agent._github_models_reasoning_extra_body() if is_github_responses else None,
         replay_encrypted_reasoning=bool(getattr(agent, "_codex_reasoning_replay_enabled", True)),
         context_management=context_management, text_verbosity=getattr(agent, "text_verbosity", None))
 
@@ -1441,8 +1441,8 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
     _is_qwen = agent._is_qwen_portal()
     _is_or = agent._is_openrouter_url()
     _host = agent._base_url_lower
+    _is_gh = base_url_host_matches(_host, "models.github.ai") or base_url_host_matches(_host, "githubcopilot.com")
     _is_lmstudio = (agent.provider or "").strip().lower() == "lmstudio"
-    _profile_endpoint = agent._reasoning_endpoint_profile() is not None
 
     # _fixed_temperature_for_model may return the OMIT_TEMPERATURE sentinel
     # (temperature omitted entirely), a numeric override, or None.
@@ -1463,7 +1463,7 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
 
     _ephemeral_out = _consume_ephemeral_max_output(agent)
     from agent.reasoning_carriers import shape_wire_carriers
-    api_messages = shape_wire_carriers(api_messages, model=agent.model, base_url=agent.base_url, scope=agent)
+    api_messages = shape_wire_carriers(api_messages, model=agent.model, base_url=agent.base_url)
     # Strip image parts for non-vision models on BOTH paths (registered
     # providers with profiles used to bypass it).
     _common = dict(model=agent.model, messages=agent._prepare_messages_for_non_vision_model(api_messages),
@@ -1487,6 +1487,7 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
         is_openrouter=_is_or,
         is_nous=base_url_host_matches(_host, "nousresearch.com"),
         is_qwen_portal=_is_qwen,
+        is_github_models=_is_gh,
         is_nvidia_nim=base_url_host_matches(_host, "integrate.api.nvidia.com"),
         is_kimi=any(base_url_host_matches(agent.base_url, h) for h in ("api.kimi.com", "moonshot.ai", "moonshot.cn")),
         is_tokenhub=base_url_host_matches(_host, "tokenhub.tencentmaas.com"),
@@ -1495,7 +1496,7 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
         qwen_prepare_inplace_fn=agent._qwen_prepare_chat_messages_inplace if _is_qwen else None,
         fixed_temperature=_fixed_temp,
         omit_temperature=_omit_temp,
-        profile_endpoint=_profile_endpoint, endpoint_reasoning=agent._endpoint_reasoning_payload() if _profile_endpoint else None,
+        github_reasoning_extra=agent._github_models_reasoning_extra_body() if _is_gh else None,
         provider_name=agent.provider,
     )
 
@@ -1627,7 +1628,7 @@ def _assistant_tool_call_dict(agent, tool_call, index: int) -> dict:
     extra = getattr(tool_call, "extra_content", None)
     if extra is not None:
         tc_dict["extra_content"] = _dump_if_model(extra)
-    # Some gateways sign Gemini 3 calls inside ``function`` (replayed only where the endpoint profile asks).
+    # Copilot's Gemini 3 variant signs the call inside ``function`` (replayed only to Copilot).
     from agent.reasoning_carriers import field
     fn_sig = field(tool_call, "thought_signature") or getattr(tool_call.function, "thought_signature", None)
     if isinstance(fn_sig, str) and fn_sig:
@@ -1730,7 +1731,7 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
 
     from agent.reasoning_carriers import carrier_record
     if record := carrier_record(assistant_message):
-        # Gemini text-turn signature / profile-declared reasoning carriers: top-level for the live
+        # Gemini text-turn signature / Copilot reasoning_opaque+text: top-level for the live
         # history, a private reasoning_details record for persistence (reasoning_carriers.py).
         msg.update({k: v for k, v in record.items() if k != "type"})
         msg["reasoning_details"] = [*msg.get("reasoning_details", ()), record]
@@ -1863,7 +1864,7 @@ def _fallback_api_mode_resolved(agent, fb_provider: str, fb_model: str, fb_base_
         return "anthropic_messages"
     if agent._is_azure_openai_url(fb_base_url):
         return "chat_completions"  # Azure serves gpt-5.x on /chat/completions — no Responses API.
-    # Per-model provider exceptions stay inside the requires-responses predicate.
+    # Provider exceptions (Copilot gpt-5-mini) stay inside the requires-responses predicate.
     if agent._is_direct_openai_url(fb_base_url) or agent._provider_model_requires_responses_api(fb_model, provider=fb_provider):
         return "codex_responses"
     host = base_url_hostname(fb_base_url)
@@ -1939,6 +1940,133 @@ def _candidate_pool_exhausted(agent, fb_provider: str, fb_model: str) -> bool:
     return until is None or until - time.time() > 600
 
 
+def _fallback_candidate_credential(fb: dict, fb_provider: str) -> str:
+    """The credential the RUNTIME would use for this candidate, best effort.
+
+    The window has to be resolved with the candidate's own credential: the same model slug
+    can carry a different limit per provider (copilot's ``gpt-4.1`` is 128,000, not the
+    1,047,576 the generic table reports), and a candidate resolved without its key falls
+    back to the generic number — which would make a too-small candidate look big enough.
+    """
+    try:
+        from hermes_cli.fallback_config import resolve_entry_api_key
+        key = str(resolve_entry_api_key(fb) or "").strip()
+        if key:
+            return key
+    except Exception:
+        pass
+    # Provider-owned credential seam: a provider profile can hold the secret itself.
+    try:
+        from providers import get_provider_profile
+        profile = get_provider_profile(fb_provider) if fb_provider else None
+        resolver = getattr(profile, "resolve_api_key_secret", None) if profile is not None else None
+        if callable(resolver):
+            secret = resolver()
+            if secret:
+                return str(secret[0] or "").strip()
+    except Exception:
+        pass
+    # A provider whose credential is ambient (Copilot: env vars, then the gh CLI) and whose
+    # live catalog is the authoritative limit. Providers that ship as a plugin resolve their
+    # own credential inside their profile, so this is a fallback for the in-tree case only.
+    if fb_provider in {"copilot", "copilot-acp", "github-copilot"}:
+        try:
+            from hermes_cli.copilot_auth import resolve_copilot_token
+            return str((resolve_copilot_token() or ("", ""))[0] or "").strip()
+        except Exception:
+            return ""
+    return ""
+
+
+def _fallback_candidate_window(fb: dict, fb_provider: str, fb_model: str) -> int:
+    """The context window the RUNTIME would use for this candidate, or 0 when unknown.
+
+    An unknown window is reported as 0 so the caller treats it as "no evidence" rather
+    than "fits": the provider's live catalog is consulted when it is reachable, and a
+    miss there means the limit could not be established.
+    """
+    if fb.get("context_length"):
+        try:
+            return int(fb["context_length"])
+        except (TypeError, ValueError):
+            return 0
+    api_key = _fallback_candidate_credential(fb, fb_provider)
+    # Provider-owned live catalog: the provider enforces its own limit, and it knows
+    # best which of its credentials applies.
+    try:
+        from providers import get_provider_profile
+        profile = get_provider_profile(fb_provider) if fb_provider else None
+        live = getattr(profile, "live_context_length", None) if profile is not None else None
+        if callable(live):
+            ctx = live(fb_model, api_key=api_key, base_url=str(fb.get("base_url") or ""))
+            if ctx:
+                return int(ctx)
+    except Exception:
+        pass
+    try:
+        from agent.model_metadata import get_model_context_length
+        return int(get_model_context_length(
+            fb_model,
+            base_url=str(fb.get("base_url") or ""),
+            api_key=api_key,
+            provider=fb_provider,
+        ) or 0)
+    except Exception:
+        return 0
+
+
+def _fallback_window_cannot_hold_session(agent, fb: dict, fb_provider: str, fb_model: str) -> bool:
+    """True when the candidate's context window is smaller than the request this session must send.
+
+    A fallback whose window cannot hold the request is a guaranteed dead end: the provider
+    rejects the prompt with ``model_max_prompt_tokens_exceeded`` before any answer, and the
+    session is then reported as "cannot compress further" even though the PRIMARY model had
+    a window large enough for it (#113737). The floor that matters is the size of the request
+    as it goes on the wire — system prompt + tool schemas + the message bodies — not the
+    compressible message text alone, because the parts a plugin engine cannot rewrite
+    (assistant ``tool_calls`` arguments, tool results) stay put however hard it tries.
+
+    Only a candidate whose window is KNOWN and clearly too small is skipped. An unknown
+    window (no catalog, no probe) is not evidence, so the candidate stays eligible.
+    """
+    fb_window = _fallback_candidate_window(fb, fb_provider, fb_model)
+    if fb_window <= 0:
+        return False
+
+    floor = _session_request_floor_tokens(agent)
+    if floor <= 0:
+        return False
+    if floor <= fb_window:
+        return False
+    logger.warning(
+        "Fallback skip: %s/%s window (%s tokens) is smaller than this session's request (%s tokens); "
+        "switching to it would fail with model_max_prompt_tokens_exceeded",
+        fb_provider, fb_model, f"{fb_window:,}", f"{floor:,}",
+    )
+    return True
+
+
+def _session_request_floor_tokens(agent) -> int:
+    """The size of the last request this session actually put on the wire.
+
+    The compressor records the provider's own ``prompt_tokens`` for the last response
+    (``last_real_prompt_tokens`` on the built-in compressor, ``last_prompt_tokens`` on a
+    plugin engine), which is the request AS SENT — system prompt + tool schemas +
+    message bodies. That is the honest floor for a session that has already overflowed:
+    compression can shrink the message text, but not the tool schemas and not the
+    assistant tool-call arguments, so the wire size is what the next model must fit.
+
+    Returns 0 when nothing was measured yet: an unmeasured floor is not evidence, and
+    the caller then leaves the fallback candidate eligible.
+    """
+    compressor = getattr(agent, "context_compressor", None)
+    for attr in ("last_real_prompt_tokens", "last_prompt_tokens"):
+        value = int(getattr(compressor, attr, 0) or 0)
+        if value > 0:
+            return value
+    return 0
+
+
 def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider: str, fb_model: str, unavailable: set) -> bool:
     """True when the entry is already unavailable, malformed, locally unusable, or resolves
     to the backend that just failed (falling back to it would loop the failure)."""
@@ -1946,6 +2074,8 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
         logger.debug("Fallback skip: %s previously marked unavailable", fb_key)
         return True
     if not fb_provider or not fb_model:
+        return True
+    if _fallback_window_cannot_hold_session(agent, fb, fb_provider, fb_model):
         return True
     from agent.fallback_cooldown import _is_entitlement_rejected
     if _is_entitlement_rejected(agent, fb_provider, fb_model):
@@ -2336,8 +2466,11 @@ def cleanup_task_resources(agent, task_id: str) -> None:
     terminal envs (``_cleanup_inactive_envs`` reaps them after ``terminal.lifetime_seconds``)
     and ``cleanup_browser`` in headed mode (the inactivity reaper handles idle sessions)."""
     def _headed() -> bool:
-        from tools.browser_session_cloud import is_headed_mode
-        return is_headed_mode()
+        try:
+            from tools.browser_tool_cloud import _is_headed_mode
+            return _is_headed_mode()
+        except Exception:
+            return bool(os.environ.get("AGENT_BROWSER_HEADED"))
 
     for label, skip, skip_what, cleanup in (
         ("VM", is_persistent_env, "cleanup_vm for persistent env", lambda: _ra().cleanup_vm(task_id)),
@@ -2843,7 +2976,7 @@ class _StreamingCall(StreamingWaitMonitor):
         reasoning tags inside it must still reach the display: route through
         the delta callback for tag extraction (the CLI drops non-reasoning text
         once the stream box is closed)."""
-        if self.agent.stream_delta_callback and not getattr(self.agent, "_hold_stream", False):
+        if self.agent.stream_delta_callback:
             self._quiet(lambda: (self.agent.stream_delta_callback(text), self.agent._record_streamed_assistant_text(text)))
 
     def _new_diag(self) -> dict:
@@ -3120,7 +3253,7 @@ class _StreamingCall(StreamingWaitMonitor):
             # whose deltas carry only this field otherwise trips the empty-stream guard (#56516).
             if reasoning_text is None and isinstance(getattr(delta, "model_extra", None), dict):
                 reasoning_text = delta.model_extra.get("reasoning_content") or delta.model_extra.get("reasoning")
-            # A profile-declared text carrier doubles as the readable reasoning.
+            # Copilot /chat/completions names its readable reasoning ``reasoning_text``.
             reasoning_text = carriers.feed(delta, reasoning_text)
             if reasoning_text:
                 # Summary-part models omit the separator between markdown blocks; re-insert it.
@@ -3593,7 +3726,22 @@ class _StreamingCall(StreamingWaitMonitor):
             self.clients.close_once("stream_options_rejected_retry")
             return True
 
-        _partial_tool_in_flight = self._forget_invisible_deltas(e)
+        if self.deltas_were_sent["yes"]:
+            _partial_tool_in_flight = bool(self.result.get("partial_tool_names")) or self.provider_tool_in_flight["yes"]
+            if not _partial_tool_in_flight and not self._visible_text_delivered():
+                # Deltas fired but nothing visible reached a consumer (whitespace/think-only
+                # deltas, or no display consumer at all) and no tool call is in flight: from
+                # the user's and the model's point of view NOTHING was delivered. The
+                # "partial delivery" stub would be EMPTY and the loop would ask the model to
+                # continue from nowhere, so it repeats the lost step (#112419). Classify as an
+                # undelivered failure instead: same-prefix retry, then the main loop's
+                # fallback/backoff — there is no text to duplicate.
+                logger.warning(
+                    "Stream died after deltas but before any visible text was delivered (0 chars, "
+                    "no tool call in flight); treating as an undelivered stream failure: %s", e)
+                self._quiet(self.agent._reset_stream_delivery_tracking)
+                self.deltas_were_sent["yes"] = False
+                self.first_delta_fired["done"] = False
         if self.deltas_were_sent["yes"]:
             # Died AFTER tokens were delivered: normally no retry (would duplicate
             # text). Exception: a tool call in flight — aborting discards it, so
@@ -3827,7 +3975,10 @@ class _StreamingCall(StreamingWaitMonitor):
             self.clients.close_once("stale_stream_kill")
         self._shutdown_stale_attempt_socket(_killed_response)
         self._count_stale_attempt()
-        self._rearm_or_abandon_after_kill(elapsed)
+        # Reset the timer so we don't kill repeatedly while the worker unwinds.
+        self.last_chunk_time["t"] = time.time()
+        self.agent._emit_diagnostic_wait(f"⚠ no output from provider for {int(elapsed)}s — reconnecting...")
+        self.agent._touch_activity(f"stale stream detected after {int(elapsed)}s, reconnecting")
 
     def _abort_for_interrupt(self, stale_elapsed: float) -> None:
         """/stop seen by the monitor: mark cancelled, abort the request-local
@@ -3871,13 +4022,14 @@ class _StreamingCall(StreamingWaitMonitor):
             return
         self._stream_stale_timeout = _cloud_stale_timeout_for(self.agent, self.api_kwargs)
 
-    def _partial_stream_stub(self, error):
+    def _partial_stream_stub(self):
         """Tokens already reached the platform: a finish_reason="length" stub fires the
         continuation machinery; tool_calls=None blocks executing incomplete calls.
         Content may be EMPTY (dropped tool call, overflow) — the loop skips appending an
         empty stub and only sends the nudge (placeholder text leaked into the stitched
         response). A text-only death with 0 visible chars never gets here: the error
         handler reclassifies it as undelivered (#112419)."""
+        error = self.result["error"]
         _partial_text = (getattr(self.agent, "_current_streamed_assistant_text", "") or "").strip() or None
         _partial_names = list(self.result.get("partial_tool_names") or [])
         if _partial_names:
@@ -3955,23 +4107,16 @@ class _StreamingCall(StreamingWaitMonitor):
             raise InterruptedError("Agent interrupted during streaming API call")
         if self.agent._interrupt_requested:  # worker returned early before the monitor saw the flag
             raise InterruptedError("Agent interrupted during streaming API call (post-worker)")
-        # Read the outcome once: an abandoned worker can still write into ``self.result`` later.
-        error, response = self.result["error"], self.result["response"]
-        if self._abandon_error is not None:
-            # Same bounded Relay join as /stop (#81521), before the retry opens a new scope.
-            _join_worker_for_relay_teardown(self.worker, label="Abandoned streaming")
-            error, response = self._abandon_error, None
-            self._forget_invisible_deltas(error)  # nothing visible: retry, not a stub
-        if error is not None:
+        if self.result["error"] is not None:
             if self.deltas_were_sent["yes"]:
-                return self._partial_stream_stub(error)
-            raise error
-        if response is not None:
+                return self._partial_stream_stub()
+            raise self.result["error"]
+        if self.result["response"] is not None:
             _reset_stale_streak(self.agent)  # provider proved responsive: clear the breaker
         # Propagate first-chunk timing for the ``post_api_request`` hook.
         if isinstance(self.clients.diag, dict) and self.clients.diag.get("first_chunk_at"):
             self.agent._last_api_first_chunk_at = float(self.clients.diag["first_chunk_at"])
-        return response
+        return self.result["response"]
 
 
 def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=None):
